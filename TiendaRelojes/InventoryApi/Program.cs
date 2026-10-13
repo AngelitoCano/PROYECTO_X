@@ -1,47 +1,928 @@
+
+/* ============================================================
+   MICROSERVICIO DE INVENTARIO
+   Tecnología: ASP.NET Core + Entity Framework Core + SQLite
+   Comunicación: Apache Kafka
+
+   FUNCIONALIDADES:
+   1. Configuración del servidor
+   2. Inicialización de la base de datos
+   3. Productos iniciales
+   4. API de productos
+   5. Movimientos de inventario
+   6. Ajustes de existencias
+   7. Modelos de entrada
+   8. Entidades de base de datos
+   9. Contexto Entity Framework
+   10. Procesamiento de eventos Kafka
+   11. Reservas y confirmaciones de pagos
+   12. Ejecución del servidor
+============================================================ */
+
+
+// ============================================================
+// 1. IMPORTACIÓN DE DEPENDENCIAS
+// ============================================================
+
+// Permite trabajar con Entity Framework Core y SQLite.
 using Microsoft.EntityFrameworkCore;
+
+// Contiene las clases compartidas entre microservicios,
+// incluyendo los eventos y sus respectivos mensajes.
 using Shared;
-var builder=WebApplication.CreateBuilder(args);
-builder.Services.AddDbContext<InventoryDb>(o=>o.UseSqlite(builder.Configuration.GetConnectionString("Db")??"Data Source=/data/inventory.db"));
+
+
+// ============================================================
+// 2. CONFIGURACIÓN DEL SERVIDOR
+// ============================================================
+
+// Crea el constructor de la aplicación ASP.NET Core.
+var builder = WebApplication.CreateBuilder(args);
+
+// Registra el contexto de base de datos con SQLite.
+builder.Services.AddDbContext<InventoryDb>(options =>
+    options.UseSqlite(
+        builder.Configuration.GetConnectionString("Db")
+        ?? "Data Source=/data/inventory.db"
+    )
+);
+
+// Registra el servicio que escucha eventos de Kafka.
 builder.Services.AddHostedService<InventoryWorker>();
-builder.Services.AddCors(o=>o.AddDefaultPolicy(p=>p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
-var app=builder.Build();app.UseCors();
-using(var scope=app.Services.CreateScope()){
- var db=scope.ServiceProvider.GetRequiredService<InventoryDb>();db.Database.EnsureCreated();
- if(!db.Products.Any()) {db.Products.AddRange(new Product {Name="Casio Rose Gold Diamond",Category="Casio",Price=32,Stock=12,Image="/images/rose.svg",Description="Reloj de estilo vintage en tono rosa dorado."},new Product{Name="Casio Old Money Plata",Category="Casio",Price=32,Stock=8,Image="/images/silver.svg",Description="Diseño clásico plateado con esfera clara."},new Product{Name="Casio Classic Dorado",Category="Casio",Price=32,Stock=10,Image="/images/gold.svg",Description="Reloj dorado de estilo elegante."},new Product{Name="Casio Classic Plata Azul",Category="Casio",Price=32,Stock=6,Image="/images/blue.svg",Description="Reloj plateado con esfera azul."});db.SaveChanges();}
+
+// Configura CORS para permitir solicitudes HTTP
+// desde diferentes orígenes.
+builder.Services.AddCors(options =>
+    options.AddDefaultPolicy(policy =>
+        policy
+            .AllowAnyOrigin()
+            .AllowAnyMethod()
+            .AllowAnyHeader()
+    )
+);
+
+// Construye la aplicación.
+var app = builder.Build();
+
+// Habilita CORS.
+app.UseCors();
+
+
+// ============================================================
+// 3. INICIALIZACIÓN DE LA BASE DE DATOS
+// ============================================================
+
+// Crea un ámbito para acceder al contexto de base de datos.
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider
+        .GetRequiredService<InventoryDb>();
+
+    // Crea la base de datos si todavía no existe.
+    db.Database.EnsureCreated();
+
+    // Inserta productos de ejemplo únicamente cuando
+    // la tabla de productos está vacía.
+    if (!db.Products.Any())
+    {
+        db.Products.AddRange(
+
+            new Product
+            {
+                Name = "Casio Rose Gold Diamond",
+                Category = "Casio",
+                Price = 32,
+                Stock = 12,
+                Image = "/images/rose.svg",
+                Description =
+                    "Reloj de estilo vintage en tono rosa dorado."
+            },
+
+            new Product
+            {
+                Name = "Casio Old Money Plata",
+                Category = "Casio",
+                Price = 32,
+                Stock = 8,
+                Image = "/images/silver.svg",
+                Description =
+                    "Diseño clásico plateado con esfera clara."
+            },
+
+            new Product
+            {
+                Name = "Casio Classic Dorado",
+                Category = "Casio",
+                Price = 32,
+                Stock = 10,
+                Image = "/images/gold.svg",
+                Description =
+                    "Reloj dorado de estilo elegante."
+            },
+
+            new Product
+            {
+                Name = "Casio Classic Plata Azul",
+                Category = "Casio",
+                Price = 32,
+                Stock = 6,
+                Image = "/images/blue.svg",
+                Description =
+                    "Reloj plateado con esfera azul."
+            }
+        );
+
+        // Guarda los productos iniciales.
+        db.SaveChanges();
+    }
 }
-app.MapGet("/health",()=>Results.Ok(new{status="ok"}));
-app.MapGet("/products",async(InventoryDb db)=>await db.Products.OrderBy(p=>p.Id).ToListAsync());
-app.MapGet("/products/{id:int}",async(int id,InventoryDb db)=>await db.Products.FindAsync(id) is {} p?Results.Ok(p):Results.NotFound());
-app.MapPost("/products",async(ProductInput input,InventoryDb db)=>{if(string.IsNullOrWhiteSpace(input.Name)||input.Price<0||input.Stock<0)return Results.BadRequest("Datos inválidos");var p=new Product{Name=input.Name,Category=input.Category,Price=input.Price,Stock=input.Stock,Image=input.Image,Description=input.Description};db.Products.Add(p);await db.SaveChangesAsync();return Results.Created($"/products/{p.Id}",p);});
-app.MapPut("/products/{id:int}",async(int id,ProductInput input,InventoryDb db)=>{var p=await db.Products.FindAsync(id);if(p is null)return Results.NotFound();if(input.Price<0||input.Stock<0||string.IsNullOrWhiteSpace(input.Name))return Results.BadRequest();p.Name=input.Name;p.Category=input.Category;p.Price=input.Price;p.Stock=input.Stock;p.Image=input.Image;p.Description=input.Description;await db.SaveChangesAsync();return Results.Ok(p);});
-app.MapDelete("/products/{id:int}",async(int id,InventoryDb db)=>{var p=await db.Products.FindAsync(id);if(p is null)return Results.NotFound();db.Products.Remove(p);await db.SaveChangesAsync();return Results.NoContent();});
-app.MapGet("/movements",async(InventoryDb db)=>await db.Movements.OrderByDescending(m=>m.Id).Take(100).ToListAsync());
-app.MapPost("/products/{id:int}/adjust",async(int id,AdjustRequest req,InventoryDb db)=>{var p=await db.Products.FindAsync(id);if(p is null)return Results.NotFound();if(p.Stock+req.Change<0)return Results.BadRequest("Stock insuficiente");p.Stock+=req.Change;db.Movements.Add(new StockMovement{ProductId=id,Change=req.Change,Reason=req.Reason??"Ajuste manual"});await db.SaveChangesAsync();return Results.Ok(p);});
+
+
+// ============================================================
+// 4. ENDPOINT DE VERIFICACIÓN DEL SERVICIO
+// ============================================================
+
+/*
+   GET /health
+
+   Comprueba que el microservicio esté respondiendo.
+
+   Respuesta:
+   {
+       "status": "ok"
+   }
+*/
+
+app.MapGet("/health", () =>
+    Results.Ok(new
+    {
+        status = "ok"
+    })
+);
+
+
+// ============================================================
+// 5. ENDPOINTS DE ADMINISTRACIÓN DE PRODUCTOS
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 5.1. OBTENER TODOS LOS PRODUCTOS
+// ------------------------------------------------------------
+
+/*
+   GET /products
+
+   Consulta todos los productos registrados y los
+   devuelve ordenados por identificador.
+*/
+
+app.MapGet("/products", async (InventoryDb db) =>
+    await db.Products
+        .OrderBy(p => p.Id)
+        .ToListAsync()
+);
+
+
+// ------------------------------------------------------------
+// 5.2. OBTENER UN PRODUCTO POR ID
+// ------------------------------------------------------------
+
+/*
+   GET /products/{id}
+
+   Busca un producto utilizando su identificador.
+
+   Devuelve:
+   - 200 OK si existe.
+   - 404 Not Found si no existe.
+*/
+
+app.MapGet(
+    "/products/{id:int}",
+    async (int id, InventoryDb db) =>
+        await db.Products.FindAsync(id) is { } product
+            ? Results.Ok(product)
+            : Results.NotFound()
+);
+
+
+// ------------------------------------------------------------
+// 5.3. REGISTRAR UN NUEVO PRODUCTO
+// ------------------------------------------------------------
+
+/*
+   POST /products
+
+   Registra un producto nuevo.
+
+   Validaciones:
+   - Nombre obligatorio.
+   - Precio no negativo.
+   - Stock no negativo.
+*/
+
+app.MapPost(
+    "/products",
+    async (ProductInput input, InventoryDb db) =>
+    {
+        // Validación de los datos recibidos.
+        if (
+            string.IsNullOrWhiteSpace(input.Name) ||
+            input.Price < 0 ||
+            input.Stock < 0
+        )
+        {
+            return Results.BadRequest("Datos inválidos");
+        }
+
+        // Construye la entidad del producto.
+        var product = new Product
+        {
+            Name = input.Name,
+            Category = input.Category,
+            Price = input.Price,
+            Stock = input.Stock,
+            Image = input.Image,
+            Description = input.Description
+        };
+
+        // Agrega el producto a la base de datos.
+        db.Products.Add(product);
+
+        // Guarda los cambios.
+        await db.SaveChangesAsync();
+
+        // Devuelve la ubicación del nuevo recurso.
+        return Results.Created(
+            $"/products/{product.Id}",
+            product
+        );
+    }
+);
+
+
+// ------------------------------------------------------------
+// 5.4. ACTUALIZAR UN PRODUCTO EXISTENTE
+// ------------------------------------------------------------
+
+/*
+   PUT /products/{id}
+
+   Permite modificar la información de un producto:
+   nombre, categoría, precio, stock, imagen y descripción.
+*/
+
+app.MapPut(
+    "/products/{id:int}",
+    async (
+        int id,
+        ProductInput input,
+        InventoryDb db
+    ) =>
+    {
+        // Busca el producto.
+        var product = await db.Products.FindAsync(id);
+
+        if (product is null)
+        {
+            return Results.NotFound();
+        }
+
+        // Verifica los datos.
+        if (
+            input.Price < 0 ||
+            input.Stock < 0 ||
+            string.IsNullOrWhiteSpace(input.Name)
+        )
+        {
+            return Results.BadRequest();
+        }
+
+        // Actualiza las propiedades.
+        product.Name = input.Name;
+        product.Category = input.Category;
+        product.Price = input.Price;
+        product.Stock = input.Stock;
+        product.Image = input.Image;
+        product.Description = input.Description;
+
+        // Guarda los cambios.
+        await db.SaveChangesAsync();
+
+        return Results.Ok(product);
+    }
+);
+
+
+// ------------------------------------------------------------
+// 5.5. ELIMINAR UN PRODUCTO
+// ------------------------------------------------------------
+
+/*
+   DELETE /products/{id}
+
+   Elimina un producto de la base de datos.
+
+   Respuestas:
+   - 204 No Content: eliminado correctamente.
+   - 404 Not Found: producto inexistente.
+*/
+
+app.MapDelete(
+    "/products/{id:int}",
+    async (int id, InventoryDb db) =>
+    {
+        var product = await db.Products.FindAsync(id);
+
+        if (product is null)
+        {
+            return Results.NotFound();
+        }
+
+        db.Products.Remove(product);
+
+        await db.SaveChangesAsync();
+
+        return Results.NoContent();
+    }
+);
+
+
+// ============================================================
+// 6. MOVIMIENTOS DE INVENTARIO
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 6.1. CONSULTAR MOVIMIENTOS
+// ------------------------------------------------------------
+
+/*
+   GET /movements
+
+   Devuelve los últimos 100 movimientos registrados,
+   ordenados desde el más reciente.
+*/
+
+app.MapGet("/movements", async (InventoryDb db) =>
+    await db.Movements
+        .OrderByDescending(m => m.Id)
+        .Take(100)
+        .ToListAsync()
+);
+
+
+// ------------------------------------------------------------
+// 6.2. AJUSTAR EXISTENCIAS
+// ------------------------------------------------------------
+
+/*
+   POST /products/{id}/adjust
+
+   Permite aumentar o disminuir las existencias.
+
+   Ejemplos:
+   Change = 5  -> aumenta 5 unidades.
+   Change = -2 -> disminuye 2 unidades.
+
+   Cada ajuste genera un movimiento de inventario.
+*/
+
+app.MapPost(
+    "/products/{id:int}/adjust",
+    async (
+        int id,
+        AdjustRequest request,
+        InventoryDb db
+    ) =>
+    {
+        // Busca el producto.
+        var product = await db.Products.FindAsync(id);
+
+        if (product is null)
+        {
+            return Results.NotFound();
+        }
+
+        // Impide que el stock total sea negativo.
+        if (product.Stock + request.Change < 0)
+        {
+            return Results.BadRequest(
+                "Stock insuficiente"
+            );
+        }
+
+        // Actualiza las existencias.
+        product.Stock += request.Change;
+
+        // Registra el movimiento realizado.
+        db.Movements.Add(new StockMovement
+        {
+            ProductId = id,
+            Change = request.Change,
+            Reason = request.Reason ?? "Ajuste manual"
+        });
+
+        await db.SaveChangesAsync();
+
+        return Results.Ok(product);
+    }
+);
+
+
+// ============================================================
+// 7. INICIALIZACIÓN DEL SERVIDOR
+// ============================================================
+
+// Inicia la aplicación y habilita los endpoints.
 app.Run();
-record ProductInput(string Name,string Category,decimal Price,int Stock,string Image,string Description);
-record AdjustRequest(int Change,string? Reason);
-public class Product{public int Id{get;set;}public string Name{get;set;}="";public string Category{get;set;}="";public decimal Price{get;set;}public int Stock{get;set;}public int Reserved{get;set;}public string Image{get;set;}="";public string Description{get;set;}="";}
-public class StockMovement{public int Id{get;set;}public int ProductId{get;set;}public int Change{get;set;}public string Reason{get;set;}="";public DateTime At{get;set;}=DateTime.UtcNow;}
-public class Reservation{public int Id{get;set;}public Guid OrderId{get;set;}public int ProductId{get;set;}public int Quantity{get;set;}public string Status{get;set;}="reserved";}
-public class ProcessedInventoryEvent{public int Id{get;set;}public Guid EventId{get;set;}}
-public class InventoryDb(DbContextOptions<InventoryDb> options):DbContext(options){public DbSet<Product> Products=>Set<Product>();public DbSet<Reservation> Reservations=>Set<Reservation>();public DbSet<StockMovement> Movements=>Set<StockMovement>();public DbSet<ProcessedInventoryEvent> Processed=>Set<ProcessedInventoryEvent>();protected override void OnModelCreating(ModelBuilder b){b.Entity<ProcessedInventoryEvent>().HasIndex(x=>x.EventId).IsUnique();b.Entity<Reservation>().HasIndex(x=>new{x.OrderId,x.ProductId}).IsUnique();}}
-public class InventoryWorker(IServiceScopeFactory scopes,IConfiguration config,ILogger<InventoryWorker> logger):BackgroundService{
- protected override async Task ExecuteAsync(CancellationToken stoppingToken){await Task.Delay(3000,stoppingToken);while(!stoppingToken.IsCancellationRequested){try{using var consumer=Events.Consumer(config,"inventory-service");while(!stoppingToken.IsCancellationRequested){var result=consumer.Consume(stoppingToken);var ev=Events.Parse<EventMessage>(result.Message.Value);using var scope=scopes.CreateScope();var db=scope.ServiceProvider.GetRequiredService<InventoryDb>();if(await db.Processed.AnyAsync(x=>x.EventId==ev.Id,stoppingToken)){consumer.Commit(result);continue;}
- string? response=null;object? payload=null;
- if(ev.Type=="OrderPlaced"){
-  var order=Events.Parse<OrderPlaced>(ev.Data);var valid=order.Items.Count>0;string reason="Stock insuficiente";
-  foreach(var line in order.Items){var product=await db.Products.FindAsync(new object[]{line.ProductId},stoppingToken);if(product is null||line.Quantity<=0||product.Stock-product.Reserved<line.Quantity){valid=false;break;}}
-  if(valid){foreach(var line in order.Items){var p=await db.Products.FindAsync(new object[]{line.ProductId},stoppingToken);p!.Reserved+=line.Quantity;db.Reservations.Add(new Reservation{OrderId=order.OrderId,ProductId=line.ProductId,Quantity=line.Quantity});}response="StockReserved";payload=new StockReserved(order.OrderId);}
-  else{response="StockRejected";payload=new StockRejected(order.OrderId,reason);}
- }
- if(ev.Type is "PaymentConfirmed" or "PaymentFailed" or "OrderCancelled"){
-  Guid orderId=ev.Type=="PaymentConfirmed"?Events.Parse<PaymentConfirmed>(ev.Data).OrderId:ev.Type=="PaymentFailed"?Events.Parse<PaymentFailed>(ev.Data).OrderId:Events.Parse<OrderCancelled>(ev.Data).OrderId;
-  var reservations=await db.Reservations.Where(x=>x.OrderId==orderId&&x.Status=="reserved").ToListAsync(stoppingToken);
-  foreach(var r in reservations){var p=await db.Products.FindAsync(new object[]{r.ProductId},stoppingToken);if(p is null)continue;p.Reserved-=r.Quantity;if(ev.Type=="PaymentConfirmed"){p.Stock-=r.Quantity;db.Movements.Add(new StockMovement{ProductId=p.Id,Change=-r.Quantity,Reason=$"Venta {orderId}"});}r.Status=ev.Type=="PaymentConfirmed"?"sold":"released";}
- }
- db.Processed.Add(new ProcessedInventoryEvent{EventId=ev.Id});await db.SaveChangesAsync(stoppingToken);
- if(response!=null)await Events.Publish(config,response,payload!,stoppingToken);
- consumer.Commit(result);
- }}catch(OperationCanceledException){break;}catch(Exception ex){logger.LogError(ex,"Inventory Kafka worker retrying");await Task.Delay(2500,stoppingToken);}}
- }
+
+
+// ============================================================
+// 8. MODELOS DE ENTRADA (DTO)
+// ============================================================
+
+/*
+   ProductInput
+
+   Define los datos que recibe la API cuando se
+   registra o actualiza un producto.
+*/
+
+record ProductInput(
+    string Name,
+    string Category,
+    decimal Price,
+    int Stock,
+    string Image,
+    string Description
+);
+
+
+/*
+   AdjustRequest
+
+   Define los datos necesarios para modificar
+   las existencias de un producto.
+*/
+
+record AdjustRequest(
+    int Change,
+    string? Reason
+);
+
+
+// ============================================================
+// 9. ENTIDADES DE LA BASE DE DATOS
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 9.1. ENTIDAD PRODUCTO
+// ------------------------------------------------------------
+
+/// <summary>
+/// Representa un producto disponible en la tienda.
+/// </summary>
+public class Product
+{
+    public int Id { get; set; }
+
+    public string Name { get; set; } = "";
+
+    public string Category { get; set; } = "";
+
+    public decimal Price { get; set; }
+
+    // Cantidad total registrada en inventario.
+    public int Stock { get; set; }
+
+    // Cantidad reservada por pedidos pendientes.
+    public int Reserved { get; set; }
+
+    public string Image { get; set; } = "";
+
+    public string Description { get; set; } = "";
+}
+
+
+// ------------------------------------------------------------
+// 9.2. ENTIDAD MOVIMIENTO DE INVENTARIO
+// ------------------------------------------------------------
+
+/// <summary>
+/// Registra las entradas y salidas de productos.
+/// </summary>
+public class StockMovement
+{
+    public int Id { get; set; }
+
+    public int ProductId { get; set; }
+
+    // Positivo: entrada.
+    // Negativo: salida.
+    public int Change { get; set; }
+
+    public string Reason { get; set; } = "";
+
+    // Fecha y hora del movimiento en UTC.
+    public DateTime At { get; set; } = DateTime.UtcNow;
+}
+
+
+// ------------------------------------------------------------
+// 9.3. ENTIDAD RESERVA DE INVENTARIO
+// ------------------------------------------------------------
+
+/// <summary>
+/// Representa productos reservados para un pedido.
+/// </summary>
+public class Reservation
+{
+    public int Id { get; set; }
+
+    public Guid OrderId { get; set; }
+
+    public int ProductId { get; set; }
+
+    public int Quantity { get; set; }
+
+    // Estados esperados:
+    // reserved: reservado
+    // sold: vendido
+    // released: liberado
+    public string Status { get; set; } = "reserved";
+}
+
+
+// ------------------------------------------------------------
+// 9.4. ENTIDAD EVENTO PROCESADO
+// ------------------------------------------------------------
+
+/// <summary>
+/// Almacena identificadores de eventos ya procesados
+/// para evitar procesar nuevamente el mismo evento.
+/// </summary>
+public class ProcessedInventoryEvent
+{
+    public int Id { get; set; }
+
+    public Guid EventId { get; set; }
+}
+
+
+// ============================================================
+// 10. CONTEXTO DE BASE DE DATOS
+// ============================================================
+
+/// <summary>
+/// Administra las entidades de inventario mediante
+/// Entity Framework Core.
+/// </summary>
+public class InventoryDb(
+    DbContextOptions<InventoryDb> options
+) : DbContext(options)
+{
+    // Tabla de productos.
+    public DbSet<Product> Products =>
+        Set<Product>();
+
+    // Tabla de reservas.
+    public DbSet<Reservation> Reservations =>
+        Set<Reservation>();
+
+    // Tabla de movimientos.
+    public DbSet<StockMovement> Movements =>
+        Set<StockMovement>();
+
+    // Tabla de eventos procesados.
+    public DbSet<ProcessedInventoryEvent> Processed =>
+        Set<ProcessedInventoryEvent>();
+
+
+    /// <summary>
+    /// Configura restricciones e índices únicos.
+    /// </summary>
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        // Impide duplicar identificadores de eventos.
+        builder.Entity<ProcessedInventoryEvent>()
+            .HasIndex(x => x.EventId)
+            .IsUnique();
+
+        // Impide duplicar la combinación
+        // pedido-producto en las reservas.
+        builder.Entity<Reservation>()
+            .HasIndex(x => new
+            {
+                x.OrderId,
+                x.ProductId
+            })
+            .IsUnique();
+    }
+}
+
+
+// ============================================================
+// 11. SERVICIO DE PROCESAMIENTO DE EVENTOS KAFKA
+// ============================================================
+
+/// <summary>
+/// Escucha eventos provenientes de otros microservicios
+/// y actualiza el inventario según el estado del pedido.
+/// </summary>
+public class InventoryWorker(
+    IServiceScopeFactory scopes,
+    IConfiguration config,
+    ILogger<InventoryWorker> logger
+) : BackgroundService
+{
+    protected override async Task ExecuteAsync(
+        CancellationToken stoppingToken
+    )
+    {
+        // Espera inicial antes de conectarse a Kafka.
+        await Task.Delay(3000, stoppingToken);
+
+        // Mantiene activo el procesamiento de eventos.
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                // Crea un consumidor de Kafka.
+                using var consumer = Events.Consumer(
+                    config,
+                    "inventory-service"
+                );
+
+                while (!stoppingToken.IsCancellationRequested)
+                {
+                    // Espera el siguiente evento.
+                    var result = consumer.Consume(stoppingToken);
+
+                    // Convierte el mensaje recibido.
+                    var ev = Events.Parse<EventMessage>(
+                        result.Message.Value
+                    );
+
+                    // Crea un ámbito de servicios.
+                    using var scope = scopes.CreateScope();
+
+                    var db = scope.ServiceProvider
+                        .GetRequiredService<InventoryDb>();
+
+
+                    // ----------------------------------------
+                    // 11.1. VERIFICACIÓN DE EVENTOS DUPLICADOS
+                    // ----------------------------------------
+
+                    // Comprueba si el evento ya fue procesado.
+                    if (await db.Processed.AnyAsync(
+                        x => x.EventId == ev.Id,
+                        stoppingToken
+                    ))
+                    {
+                        consumer.Commit(result);
+                        continue;
+                    }
+
+
+                    // Variables para la respuesta del inventario.
+                    string? response = null;
+                    object? payload = null;
+
+
+                    // ----------------------------------------
+                    // 11.2. EVENTO: NUEVO PEDIDO
+                    // ----------------------------------------
+
+                    if (ev.Type == "OrderPlaced")
+                    {
+                        // Obtiene los datos del pedido.
+                        var order = Events.Parse<OrderPlaced>(
+                            ev.Data
+                        );
+
+                        // Verifica que el pedido tenga productos.
+                        var valid = order.Items.Count > 0;
+
+                        string reason = "Stock insuficiente";
+
+
+                        // Verifica las existencias disponibles.
+                        foreach (var line in order.Items)
+                        {
+                            var product = await db.Products.FindAsync(
+                                new object[] { line.ProductId },
+                                stoppingToken
+                            );
+
+                            if (
+                                product is null ||
+                                line.Quantity <= 0 ||
+                                product.Stock - product.Reserved
+                                    < line.Quantity
+                            )
+                            {
+                                valid = false;
+                                break;
+                            }
+                        }
+
+
+                        // ------------------------------------
+                        // 11.3. RESERVAR PRODUCTOS
+                        // ------------------------------------
+
+                        if (valid)
+                        {
+                            foreach (var line in order.Items)
+                            {
+                                var product = await db.Products.FindAsync(
+                                    new object[] { line.ProductId },
+                                    stoppingToken
+                                );
+
+                                // Incrementa las unidades reservadas.
+                                product!.Reserved += line.Quantity;
+
+                                // Registra la reserva del pedido.
+                                db.Reservations.Add(new Reservation
+                                {
+                                    OrderId = order.OrderId,
+                                    ProductId = line.ProductId,
+                                    Quantity = line.Quantity
+                                });
+                            }
+
+                            // Prepara el evento de reserva exitosa.
+                            response = "StockReserved";
+
+                            payload = new StockReserved(
+                                order.OrderId
+                            );
+                        }
+                        else
+                        {
+                            // Prepara el evento de rechazo.
+                            response = "StockRejected";
+
+                            payload = new StockRejected(
+                                order.OrderId,
+                                reason
+                            );
+                        }
+                    }
+
+
+                    // ----------------------------------------
+                    // 11.4. EVENTOS DE PAGO Y CANCELACIÓN
+                    // ----------------------------------------
+
+                    if (
+                        ev.Type is
+                            "PaymentConfirmed" or
+                            "PaymentFailed" or
+                            "OrderCancelled"
+                    )
+                    {
+                        // Obtiene el identificador del pedido.
+                        Guid orderId =
+                            ev.Type == "PaymentConfirmed"
+                                ? Events.Parse<PaymentConfirmed>(
+                                    ev.Data
+                                ).OrderId
+
+                            : ev.Type == "PaymentFailed"
+                                ? Events.Parse<PaymentFailed>(
+                                    ev.Data
+                                ).OrderId
+
+                            : Events.Parse<OrderCancelled>(
+                                ev.Data
+                            ).OrderId;
+
+
+                        // Busca las reservas activas del pedido.
+                        var reservations = await db.Reservations
+                            .Where(x =>
+                                x.OrderId == orderId &&
+                                x.Status == "reserved"
+                            )
+                            .ToListAsync(stoppingToken);
+
+
+                        // ------------------------------------
+                        // 11.5. PROCESAR CADA RESERVA
+                        // ------------------------------------
+
+                        foreach (var reservation in reservations)
+                        {
+                            var product = await db.Products.FindAsync(
+                                new object[] {
+                                    reservation.ProductId
+                                },
+                                stoppingToken
+                            );
+
+                            if (product is null)
+                            {
+                                continue;
+                            }
+
+                            // Libera las unidades reservadas.
+                            product.Reserved -= reservation.Quantity;
+
+
+                            // --------------------------------
+                            // PAGO CONFIRMADO
+                            // --------------------------------
+
+                            if (ev.Type == "PaymentConfirmed")
+                            {
+                                // Descuenta el producto del stock.
+                                product.Stock -= reservation.Quantity;
+
+                                // Registra la salida por venta.
+                                db.Movements.Add(new StockMovement
+                                {
+                                    ProductId = product.Id,
+                                    Change = -reservation.Quantity,
+                                    Reason = $"Venta {orderId}"
+                                });
+                            }
+
+
+                            // --------------------------------
+                            // ACTUALIZAR ESTADO DE LA RESERVA
+                            // --------------------------------
+
+                            reservation.Status =
+                                ev.Type == "PaymentConfirmed"
+                                    ? "sold"
+                                    : "released";
+                        }
+                    }
+
+
+                    // ----------------------------------------
+                    // 11.6. REGISTRAR EVENTO PROCESADO
+                    // ----------------------------------------
+
+                    db.Processed.Add(
+                        new ProcessedInventoryEvent
+                        {
+                            EventId = ev.Id
+                        }
+                    );
+
+                    // Guarda los cambios en SQLite.
+                    await db.SaveChangesAsync(stoppingToken);
+
+
+                    // ----------------------------------------
+                    // 11.7. PUBLICAR RESPUESTA EN KAFKA
+                    // ----------------------------------------
+
+                    if (response != null)
+                    {
+                        await Events.Publish(
+                            config,
+                            response,
+                            payload!,
+                            stoppingToken
+                        );
+                    }
+
+
+                    // ----------------------------------------
+                    // 11.8. CONFIRMAR PROCESAMIENTO
+                    // ----------------------------------------
+
+                    consumer.Commit(result);
+                }
+            }
+
+            // Finaliza cuando se cancela el servicio.
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            // Registra errores y reintenta la conexión.
+            catch (Exception ex)
+            {
+                logger.LogError(
+                    ex,
+                    "Inventory Kafka worker retrying"
+                );
+
+                await Task.Delay(
+                    2500,
+                    stoppingToken
+                );
+            }
+        }
+    }
 }
